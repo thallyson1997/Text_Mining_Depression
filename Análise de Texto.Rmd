@@ -1,0 +1,1603 @@
+---
+title: "Análise de Texto"
+output: html_notebook
+---
+# Carregando os pacotes
+```{r}
+library(stringr)
+library(tm)
+library(caret)
+library(pROC)
+library(randomForest)
+library(xgboost)
+library(smotefamily)
+library(glmnet)
+```
+# Carregando os dados de treinamento e teste
+```{r}
+# Crie listas vazias para TREINO e TESTE
+TREINO <- list()
+TESTE <- list()
+
+# Loop para carregar os conjuntos de dados
+for (i in 1:10) {
+  arquivo_treino <- paste0("D:\\dataset\\treino_", i, ".csv")
+  arquivo_teste <- paste0("D:\\dataset\\teste_", i, ".csv")
+  conjunto_dados_treino <- read.csv(arquivo_treino, row.names = NULL)
+  conjunto_dados_teste <- read.csv(arquivo_teste, row.names = NULL)
+  conjunto_dados_treino <- subset(conjunto_dados_treino, select = -c(X))
+  conjunto_dados_teste <- subset(conjunto_dados_teste, select = -c(X))
+  TREINO[[i]] <- conjunto_dados_treino
+  TESTE[[i]] <- conjunto_dados_teste
+}
+```
+# Preparando os dados
+```{r}
+# Função remover_regex para remover expressões regulares.
+remover_regex <- function(texto){
+  lista <- c("<INDIVIDUAL>\n", "</INDIVIDUAL>\n", 
+             "<WRITING>\n\t", "</WRITING>\n", 
+             "<TITLE>", "</TITLE>\n\t", 
+             "<TEXT>", "</TEXT>\n",
+             "<ID>.*</ID>\n", "<DATE>.*</DATE>\n\t", 
+             "<INFO>.*</INFO>\n\t", "    ", "  ", "\n")
+  for (i in lista){
+    texto <- str_replace_all(texto, i, "")
+  }
+  return(texto)
+}
+# Função remover_ruido para remover pontuações, números, urls.
+remover_ruido <- function(texto){
+  texto <-  gsub('[[:punct:] ]+', ' ', texto)
+  texto <- gsub('[[:digit:]]+', '', texto)
+  return(texto)
+}
+# Função remover_stopwords para remover palavras comuns da lingua inglesa
+remover_stopword <- function(texto){
+  stopwords <- c('i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', "you're", "you've", "you'll", "you'd", 'your', 'yours', 'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', "she's", 'her', 'hers', 'herself', 'it', "it's", 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 'what', 'which', 'who', 'whom', 'this', 'that', "that'll", 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 'just', 'don', "don't", 'should', "should've", 'now', 'd', 'll', 'm', 'o', 're', 've', 'y', 'ain', 'aren', "aren't", 'couldn', "couldn't", 'didn', "didn't", 'doesn', "doesn't", 'hadn', "hadn't", 'hasn', "hasn't", 'haven', "haven't", 'isn', "isn't", 'ma', 'mightn', "mightn't", 'mustn', "mustn't", 'needn', "needn't", 'shan', "shan't", 'shouldn', "shouldn't", 'wasn', "wasn't", 'weren', "weren't", 'won', "won't", 'wouldn', "wouldn't")
+  texto <- removeWords(texto, stopwords)
+  return(texto)
+}
+
+# Função preprocessamento contem todas as função que preparam o dataset
+preprocessamento <- function(dataset){
+  dataset$Postagens <- lapply(dataset$Postagens, remover_regex)
+  dataset$Postagens <- lapply(dataset$Postagens, remover_ruido)
+  dataset$Postagens <- lapply(dataset$Postagens, tolower)
+  dataset$Postagens <- lapply(dataset$Postagens, remover_stopword)
+  dataset$Postagens <- lapply(dataset$Postagens, stemDocument)
+  return(dataset)
+}
+
+# Preparando os dados de treinamento e teste
+TREINO <- lapply(TREINO, preprocessamento)
+TESTE <- lapply(TESTE, preprocessamento)
+```
+# MÉTODO 1
+```{r}
+TREINO_1 = unserialize(serialize(TREINO, NULL))
+TESTE_1 = unserialize(serialize(TESTE, NULL))
+```
+## Verificando número de amostras
+```{r}
+# Contagem de amostra por classe
+count_train <- table(TREINO_1[[1]]$Classe)
+count_test <- table(TESTE_1[[1]]$Classe)
+#Amostra de Treino
+print(count_train)
+#Amostra de teste
+print(count_test)
+```
+## Vetorizando os dados
+```{r}
+#Função TFIDF aplica a vetorização TFIDF nos datasets
+TFIDF <- function(dataset_treino, dataset_teste, n) {
+  # Calcular o TF-IDF para o conjunto de treinamento
+  dtm_treino <- DocumentTermMatrix(dataset_treino$Postagens)
+  tfidf_treino <- weightTfIdf(dtm_treino)
+  tfidf_treino <- as.data.frame(as.matrix(tfidf_treino))
+  # Calcular o TF-IDF para o conjunto de teste
+  dtm_teste <- DocumentTermMatrix(dataset_teste$Postagens)
+  tfidf_teste <- weightTfIdf(dtm_teste)
+  tfidf_teste <- as.data.frame(as.matrix(tfidf_teste))
+  # Manter apenas as n colunas mais altas do conjunto de treinamento e do conjunto de teste
+  colunas_comuns <- sort(intersect(colnames(tfidf_treino), colnames(tfidf_teste)))
+  tfidf_treino <- tfidf_treino[, colunas_comuns]
+  tfidf_teste <- tfidf_teste[, colunas_comuns]
+  # Manter apenas as n colunas mais altas do conjunto de treinamento
+  colunas_importantes <- names(sort(colSums(tfidf_treino), decreasing = TRUE)[1:n])
+  tfidf_treino <- tfidf_treino[, colunas_importantes]
+  tfidf_teste <- tfidf_teste[, colunas_importantes]
+  # Ordem alfabetica
+  tfidf_treino <- tfidf_treino[, order(names(tfidf_treino))]
+  tfidf_teste <- tfidf_teste[, order(names(tfidf_teste))]
+  # Unir dataframe
+  tfidf_treino <- cbind(dataset_treino, tfidf_treino)
+  tfidf_teste <- cbind(dataset_teste, tfidf_teste)
+  return(list(tfidf_treino, tfidf_teste))
+}
+
+# Vetorizando os dados de treinamento e teste
+for (n in 1:10) {
+  cat("Vetorizando datasets", n, "\n")
+  tf_idf <- TFIDF(TREINO_1[[n]], TESTE_1[[n]], 250)
+  TREINO_1[[n]] <- tf_idf[[1]]
+  TESTE_1[[n]] <- tf_idf[[2]]
+}
+```
+## Treinando e testando usando Random Forest
+```{r}
+# Defina os valores de mtry (hiperparametro) que deseja avaliar
+hipeparametro <- c(2, 126, 250)
+
+# Vetores para armazenar as métricas médias para cada mtry
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de mtry
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_1))
+  sensibilidade <- numeric(length(TREINO_1))
+  especificidade <- numeric(length(TREINO_1))
+  auc_n <- numeric(length(TREINO_1))
+  fscore <- numeric(length(TREINO_1))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_1)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o mtry =', h, '\n')
+    
+    treino <- TREINO_1[[j]]
+    teste <- TESTE_1[[j]]
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treine o modelo com o valor atual de mtry
+    modelo <- train(x, y, method = "rf",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(mtry = c(h)))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F-score (usando precisão e sensibilidade)
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    fscore[j] <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      2 * (precision * recall) / (precision + recall)
+      } else {
+        NA
+        }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de mtry
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore)  # NOVO
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Mtry =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando XGBoost
+```{r}
+# Defina os valores de mtry (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(250, 300, 350)
+
+# Vetores para armazenar as métricas médias para cada valor testado
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de nround
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_1))
+  sensibilidade <- numeric(length(TREINO_1))
+  especificidade <- numeric(length(TREINO_1))
+  auc_n <- numeric(length(TREINO_1))
+  fscore <- numeric(length(TREINO_1))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_1)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o nround =', h, '\n')
+    
+    treino <- TREINO_1[[j]]
+    teste <- TESTE_1[[j]]
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treine o modelo com o valor atual de nround
+    modelo <- train(x, y, method = "xgbTree",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(nrounds = c(h), max_depth = 4, eta = 0.1, gamma = 3, colsample_bytree = 0.6, min_child_weight = 1, subsample = 0.5))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas básicas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com tratamento de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de nround
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Nrounds =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando glmnet
+```{r}
+# Defina os valores de lambda (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(0.1, 0.5, 1)
+
+# Vetores para armazenar as métricas médias
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para testar cada valor de lambda
+for (i in 1:length(hipeparametro)) {
+  lambda_atual <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_1))
+  sensibilidade <- numeric(length(TREINO_1))
+  especificidade <- numeric(length(TREINO_1))
+  auc_n <- numeric(length(TREINO_1))
+  fscore <- numeric(length(TREINO_1))
+  
+  for (j in 1:length(TREINO_1)) {
+    set.seed(42)
+    cat('Treinando e testando dataset número', j, 'com lambda =', lambda_atual, '\n')
+    
+    treino <- TREINO_1[[j]]
+    teste <- TESTE_1[[j]]
+    
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treinamento do modelo glmnet com lambda fixo
+    modelo <- train(x, y, method = "glmnet",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(alpha = 0.01, lambda = lambda_atual))
+    
+    # Previsão
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Avaliação
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = "1")
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com verificação de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    r <- roc(as.numeric(as.character(teste$Classe)), as.numeric(as.character(pred)))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Métricas médias para o lambda atual
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Lambda =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+# MÉTODO 2
+```{r}
+TREINO_2 = unserialize(serialize(TREINO, NULL))
+TESTE_2 = unserialize(serialize(TESTE, NULL))
+
+#Recombinando os dados de treinamento
+recombina <- function(treino){
+  treino$Tamanho <- as.numeric(unlist(lapply(treino$Postagens, nchar)))
+  treino <- treino[order(treino$Tamanho, decreasing = TRUE),]
+  treino1 <- subset(treino, (Classe == 1))
+  treino0 <- subset(treino, (Classe == 0))[1:nrow(treino1),]
+  treino <- rbind(treino0, treino1)
+  treino <- subset(treino, select = -Tamanho) 
+}
+
+TREINO_2 <- lapply(TREINO_2, recombina)
+```
+## Verificando número de amostras
+```{r}
+# Contagem de amostra por classe
+count_train <- table(TREINO_2[[1]]$Classe)
+count_test <- table(TESTE_2[[1]]$Classe)
+#Amostra de Treino
+print(count_train)
+#Amostra de teste
+print(count_test)
+```
+## Vetorizando os dados
+```{r}
+#Função TFIDF aplica a vetorização TFIDF nos datasets
+TFIDF <- function(dataset_treino, dataset_teste, n) {
+  # Calcular o TF-IDF para o conjunto de treinamento
+  dtm_treino <- DocumentTermMatrix(dataset_treino$Postagens)
+  tfidf_treino <- weightTfIdf(dtm_treino)
+  tfidf_treino <- as.data.frame(as.matrix(tfidf_treino))
+  # Calcular o TF-IDF para o conjunto de teste
+  dtm_teste <- DocumentTermMatrix(dataset_teste$Postagens)
+  tfidf_teste <- weightTfIdf(dtm_teste)
+  tfidf_teste <- as.data.frame(as.matrix(tfidf_teste))
+  # Manter apenas as n colunas mais altas do conjunto de treinamento e do conjunto de teste
+  colunas_comuns <- sort(intersect(colnames(tfidf_treino), colnames(tfidf_teste)))
+  tfidf_treino <- tfidf_treino[, colunas_comuns]
+  tfidf_teste <- tfidf_teste[, colunas_comuns]
+  # Manter apenas as n colunas mais altas do conjunto de treinamento
+  colunas_importantes <- names(sort(colSums(tfidf_treino), decreasing = TRUE)[1:n])
+  tfidf_treino <- tfidf_treino[, colunas_importantes]
+  tfidf_teste <- tfidf_teste[, colunas_importantes]
+  # Ordem alfabetica
+  tfidf_treino <- tfidf_treino[, order(names(tfidf_treino))]
+  tfidf_teste <- tfidf_teste[, order(names(tfidf_teste))]
+  # Unir dataframe
+  tfidf_treino <- cbind(dataset_treino, tfidf_treino)
+  tfidf_teste <- cbind(dataset_teste, tfidf_teste)
+  return(list(tfidf_treino, tfidf_teste))
+}
+
+# Vetorizando os dados de treinamento e teste
+for (n in 1:10) {
+  cat("Vetorizando datasets", n, "\n")
+  tf_idf <- TFIDF(TREINO_2[[n]], TESTE_2[[n]], 250)
+  TREINO_2[[n]] <- tf_idf[[1]]
+  TESTE_2[[n]] <- tf_idf[[2]]
+}
+```
+## Treinando e testando usando Random Forest
+```{r}
+# Defina os valores de mtry (hiperparametro) que deseja avaliar
+hipeparametro <- c(2, 126, 250)
+
+# Vetores para armazenar as métricas médias para cada mtry
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de mtry
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_2))
+  sensibilidade <- numeric(length(TREINO_2))
+  especificidade <- numeric(length(TREINO_2))
+  auc_n <- numeric(length(TREINO_2))
+  fscore <- numeric(length(TREINO_2))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_2)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o mtry =', h, '\n')
+    
+    treino <- TREINO_2[[j]]
+    teste <- TESTE_2[[j]]
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treine o modelo com o valor atual de mtry
+    modelo <- train(x, y, method = "rf",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(mtry = c(h)))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F-score (usando precisão e sensibilidade)
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    fscore[j] <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      2 * (precision * recall) / (precision + recall)
+      } else {
+        NA
+        }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de mtry
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore)  # NOVO
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Mtry =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando XGBoost
+```{r}
+# Defina os valores de mtry (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(250, 300, 350)
+
+# Vetores para armazenar as métricas médias para cada valor testado
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de nround
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_2))
+  sensibilidade <- numeric(length(TREINO_2))
+  especificidade <- numeric(length(TREINO_2))
+  auc_n <- numeric(length(TREINO_2))
+  fscore <- numeric(length(TREINO_2))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_2)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o nround =', h, '\n')
+    
+    treino <- TREINO_2[[j]]
+    teste <- TESTE_2[[j]]
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treine o modelo com o valor atual de nround
+    modelo <- train(x, y, method = "xgbTree",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(nrounds = c(h), max_depth = 4, eta = 0.1, gamma = 3, colsample_bytree = 0.6, min_child_weight = 1, subsample = 0.5))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas básicas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com tratamento de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de nround
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Nrounds =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando glmnet
+```{r}
+# Defina os valores de lambda (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(0.1, 0.5, 1)
+
+# Vetores para armazenar as métricas médias
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para testar cada valor de lambda
+for (i in 1:length(hipeparametro)) {
+  lambda_atual <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_2))
+  sensibilidade <- numeric(length(TREINO_2))
+  especificidade <- numeric(length(TREINO_2))
+  auc_n <- numeric(length(TREINO_2))
+  fscore <- numeric(length(TREINO_2))
+  
+  for (j in 1:length(TREINO_2)) {
+    set.seed(42)
+    cat('Treinando e testando dataset número', j, 'com lambda =', lambda_atual, '\n')
+    
+    treino <- TREINO_2[[j]]
+    teste <- TESTE_2[[j]]
+    
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treinamento do modelo glmnet com lambda fixo
+    modelo <- train(x, y, method = "glmnet",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(alpha = 0.01, lambda = lambda_atual))
+    
+    # Previsão
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Avaliação
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = "1")
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com verificação de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    r <- roc(as.numeric(as.character(teste$Classe)), as.numeric(as.character(pred)))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Métricas médias para o lambda atual
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Lambda =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+# MÉTODO 3
+```{r}
+TREINO_3 = unserialize(serialize(TREINO, NULL))
+TESTE_3 = unserialize(serialize(TESTE, NULL))
+
+#Recombinando os dados de treinamento
+recombina <- function(treino){
+  treino$Tamanho <- as.numeric(unlist(lapply(treino$Postagens, nchar)))
+  treino <- treino[order(treino$Tamanho, decreasing = TRUE),]
+  treino1 <- subset(treino, (Classe == 1))
+  treino0 <- subset(treino, (Classe == 0))[1:as.integer(2.5 * nrow(treino1)),]
+  treino <- rbind(treino0, treino1)
+  treino <- subset(treino, select = -Tamanho) 
+}
+
+TREINO_3 <- lapply(TREINO_3, recombina)
+```
+## Verificando número de amostras
+```{r}
+# Contagem de amostra por classe
+count_train <- table(TREINO_3[[1]]$Classe)
+count_test <- table(TESTE_3[[1]]$Classe)
+#Amostra de Treino
+print(count_train)
+#Amostra de teste
+print(count_test)
+```
+## Vetorizando os dados
+```{r}
+#Função TFIDF aplica a vetorização TFIDF nos datasets
+TFIDF <- function(dataset_treino, dataset_teste, n) {
+  # Calcular o TF-IDF para o conjunto de treinamento
+  dtm_treino <- DocumentTermMatrix(dataset_treino$Postagens)
+  tfidf_treino <- weightTfIdf(dtm_treino)
+  tfidf_treino <- as.data.frame(as.matrix(tfidf_treino))
+  # Calcular o TF-IDF para o conjunto de teste
+  dtm_teste <- DocumentTermMatrix(dataset_teste$Postagens)
+  tfidf_teste <- weightTfIdf(dtm_teste)
+  tfidf_teste <- as.data.frame(as.matrix(tfidf_teste))
+  # Manter apenas as n colunas mais altas do conjunto de treinamento e do conjunto de teste
+  colunas_comuns <- sort(intersect(colnames(tfidf_treino), colnames(tfidf_teste)))
+  tfidf_treino <- tfidf_treino[, colunas_comuns]
+  tfidf_teste <- tfidf_teste[, colunas_comuns]
+  # Manter apenas as n colunas mais altas do conjunto de treinamento
+  colunas_importantes <- names(sort(colSums(tfidf_treino), decreasing = TRUE)[1:n])
+  tfidf_treino <- tfidf_treino[, colunas_importantes]
+  tfidf_teste <- tfidf_teste[, colunas_importantes]
+  # Ordem alfabetica
+  tfidf_treino <- tfidf_treino[, order(names(tfidf_treino))]
+  tfidf_teste <- tfidf_teste[, order(names(tfidf_teste))]
+  # Unir dataframe
+  tfidf_treino <- cbind(dataset_treino, tfidf_treino)
+  tfidf_teste <- cbind(dataset_teste, tfidf_teste)
+  return(list(tfidf_treino, tfidf_teste))
+}
+
+# Vetorizando os dados de treinamento e teste
+for (n in 1:10) {
+  cat("Vetorizando datasets", n, "\n")
+  tf_idf <- TFIDF(TREINO_3[[n]], TESTE_3[[n]], 250)
+  TREINO_3[[n]] <- tf_idf[[1]]
+  TESTE_3[[n]] <- tf_idf[[2]]
+}
+```
+## Treinando e testando usando Random Forest
+```{r}
+# Defina os valores de mtry (hiperparametro) que deseja avaliar
+hipeparametro <- c(2, 126, 250)
+
+# Vetores para armazenar as métricas médias para cada mtry
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de mtry
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_3))
+  sensibilidade <- numeric(length(TREINO_3))
+  especificidade <- numeric(length(TREINO_3))
+  auc_n <- numeric(length(TREINO_3))
+  fscore <- numeric(length(TREINO_3))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_3)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o mtry =', h, '\n')
+    
+    treino <- TREINO_3[[j]]
+    teste <- TESTE_3[[j]]
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treine o modelo com o valor atual de mtry
+    modelo <- train(x, y, method = "rf",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(mtry = c(h)))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F-score (usando precisão e sensibilidade)
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    fscore[j] <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      2 * (precision * recall) / (precision + recall)
+      } else {
+        NA
+        }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de mtry
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Mtry =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando XGBoost
+```{r}
+# Defina os valores de mtry (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(250, 300, 350)
+
+# Vetores para armazenar as métricas médias para cada valor testado
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de nround
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_3))
+  sensibilidade <- numeric(length(TREINO_3))
+  especificidade <- numeric(length(TREINO_3))
+  auc_n <- numeric(length(TREINO_3))
+  fscore <- numeric(length(TREINO_3))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_3)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o nround =', h, '\n')
+    
+    treino <- TREINO_3[[j]]
+    teste <- TESTE_3[[j]]
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treine o modelo com o valor atual de nround
+    modelo <- train(x, y, method = "xgbTree",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(nrounds = c(h), max_depth = 4, eta = 0.1, gamma = 3, colsample_bytree = 0.6, min_child_weight = 1, subsample = 0.5))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas básicas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com tratamento de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de nround
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Nrounds =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando glmnet
+```{r}
+# Defina os valores de lambda (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(0.1, 0.5, 1)
+
+# Vetores para armazenar as métricas médias
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para testar cada valor de lambda
+for (i in 1:length(hipeparametro)) {
+  lambda_atual <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_3))
+  sensibilidade <- numeric(length(TREINO_3))
+  especificidade <- numeric(length(TREINO_3))
+  auc_n <- numeric(length(TREINO_3))
+  fscore <- numeric(length(TREINO_3))
+  
+  for (j in 1:length(TREINO_3)) {
+    set.seed(42)
+    cat('Treinando e testando dataset número', j, 'com lambda =', lambda_atual, '\n')
+    
+    treino <- TREINO_3[[j]]
+    teste <- TESTE_3[[j]]
+    
+    x <- treino[, 4:ncol(treino)]
+    y <- as.factor(treino$Classe)
+    
+    # Treinamento do modelo glmnet com lambda fixo
+    modelo <- train(x, y, method = "glmnet",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(alpha = 0.01, lambda = lambda_atual))
+    
+    # Previsão
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Avaliação
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = "1")
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com verificação de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    r <- roc(as.numeric(as.character(teste$Classe)), as.numeric(as.character(pred)))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Métricas médias para o lambda atual
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Lambda =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+# MÉTODO 4
+```{r}
+TREINO_4 = unserialize(serialize(TREINO, NULL))
+TESTE_4 = unserialize(serialize(TESTE, NULL))
+```
+## Vetorizando os dados
+```{r}
+#Função TFIDF aplica a vetorização TFIDF nos datasets
+TFIDF <- function(dataset_treino, dataset_teste, n) {
+  # Calcular o TF-IDF para o conjunto de treinamento
+  dtm_treino <- DocumentTermMatrix(dataset_treino$Postagens)
+  tfidf_treino <- weightTfIdf(dtm_treino)
+  tfidf_treino <- as.data.frame(as.matrix(tfidf_treino))
+  # Calcular o TF-IDF para o conjunto de teste
+  dtm_teste <- DocumentTermMatrix(dataset_teste$Postagens)
+  tfidf_teste <- weightTfIdf(dtm_teste)
+  tfidf_teste <- as.data.frame(as.matrix(tfidf_teste))
+  # Manter apenas as n colunas mais altas do conjunto de treinamento e do conjunto de teste
+  colunas_comuns <- sort(intersect(colnames(tfidf_treino), colnames(tfidf_teste)))
+  tfidf_treino <- tfidf_treino[, colunas_comuns]
+  tfidf_teste <- tfidf_teste[, colunas_comuns]
+  # Manter apenas as n colunas mais altas do conjunto de treinamento
+  colunas_importantes <- names(sort(colSums(tfidf_treino), decreasing = TRUE)[1:n])
+  tfidf_treino <- tfidf_treino[, colunas_importantes]
+  tfidf_teste <- tfidf_teste[, colunas_importantes]
+  # Ordem alfabetica
+  tfidf_treino <- tfidf_treino[, order(names(tfidf_treino))]
+  tfidf_teste <- tfidf_teste[, order(names(tfidf_teste))]
+  # Unir dataframe
+  tfidf_treino <- cbind(dataset_treino, tfidf_treino)
+  tfidf_teste <- cbind(dataset_teste, tfidf_teste)
+  return(list(tfidf_treino, tfidf_teste))
+}
+
+# Vetorizando os dados de treinamento e teste
+for (n in 1:10) {
+  cat("Vetorizando datasets", n, "\n")
+  tf_idf <- TFIDF(TREINO_4[[n]], TESTE_4[[n]], 250)
+  TREINO_4[[n]] <- tf_idf[[1]]
+  TESTE_4[[n]] <- tf_idf[[2]]
+}
+```
+## Utilizando SMOTE
+```{r}
+aplicar_SMOTE <- function(data){
+  set.seed(42)
+  genData <- SMOTE(data[,4:253],data[,3], K = 81)
+  genData <- genData$data
+  colnames(genData)[ncol(genData)] <- "Classe"
+  return(genData)
+}
+TREINO_4 <- lapply(TREINO_4, aplicar_SMOTE)
+```
+## Verificando número de amostras
+```{r}
+# Contagem de amostra por classe
+count_train <- table(TREINO_4[[1]]$Classe)
+count_test <- table(TESTE_4[[1]]$Classe)
+#Amostra de Treino
+print(count_train)
+#Amostra de teste
+print(count_test)
+```
+## Treinando e testando usando Random Forest
+```{r}
+# Defina os valores de mtry (hiperparametro) que deseja avaliar
+hipeparametro <- c(2, 126, 250)
+
+# Vetores para armazenar as métricas médias para cada mtry
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de mtry
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_4))
+  sensibilidade <- numeric(length(TREINO_4))
+  especificidade <- numeric(length(TREINO_4))
+  auc_n <- numeric(length(TREINO_4))
+  fscore <- numeric(length(TREINO_4))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_4)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o mtry =', h, '\n')
+    
+    treino <- TREINO_4[[j]]
+    teste <- TESTE_4[[j]]
+    x <- treino[,-ncol(treino)]
+    y <- as.factor(treino[, ncol(treino)])
+    
+    # Treine o modelo com o valor atual de mtry
+    modelo <- train(x, y, method = "rf",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(mtry = c(h)))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F-score (usando precisão e sensibilidade)
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    fscore[j] <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      2 * (precision * recall) / (precision + recall)
+      } else {
+        NA
+        }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de mtry
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Mtry =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando XGBoost
+```{r}
+# Defina os valores de mtry (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(250, 300, 350)
+
+# Vetores para armazenar as métricas médias para cada valor testado
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de nround
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_4))
+  sensibilidade <- numeric(length(TREINO_4))
+  especificidade <- numeric(length(TREINO_4))
+  auc_n <- numeric(length(TREINO_4))
+  fscore <- numeric(length(TREINO_4))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_4)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o nround =', h, '\n')
+    
+    treino <- TREINO_4[[j]]
+    teste <- TESTE_4[[j]]
+    x <- treino[,-ncol(treino)]
+    y <- as.factor(treino[, ncol(treino)])
+    
+    # Treine o modelo com o valor atual de nround
+    modelo <- train(x, y, method = "xgbTree",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(nrounds = c(h), max_depth = 4, eta = 0.1, gamma = 3, colsample_bytree = 0.6, min_child_weight = 1, subsample = 0.5))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas básicas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com tratamento de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de nround
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Nrounds =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando glmnet
+```{r}
+# Defina os valores de lambda (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(0.1, 0.5, 1)
+
+# Vetores para armazenar as métricas médias
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para testar cada valor de lambda
+for (i in 1:length(hipeparametro)) {
+  lambda_atual <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_4))
+  sensibilidade <- numeric(length(TREINO_4))
+  especificidade <- numeric(length(TREINO_4))
+  auc_n <- numeric(length(TREINO_4))
+  fscore <- numeric(length(TREINO_4))
+  
+  for (j in 1:length(TREINO_4)) {
+    set.seed(42)
+    cat('Treinando e testando dataset número', j, 'com lambda =', lambda_atual, '\n')
+    
+    treino <- TREINO_4[[j]]
+    teste <- TESTE_4[[j]]
+    
+    x <- treino[,-ncol(treino)]
+    y <- as.factor(treino[, ncol(treino)])
+    
+    # Treinamento do modelo glmnet com lambda fixo
+    modelo <- train(x, y, method = "glmnet",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(alpha = 0.01, lambda = lambda_atual))
+    
+    # Previsão
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Avaliação
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = "1")
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com verificação de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    r <- roc(as.numeric(as.character(teste$Classe)), as.numeric(as.character(pred)))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Métricas médias para o lambda atual
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Lambda =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+# MÉTODO 5
+```{r}
+TREINO_5 = unserialize(serialize(TREINO, NULL))
+TESTE_5 = unserialize(serialize(TESTE, NULL))
+
+#Recombinando os dados de treinamento
+recombina <- function(treino){
+  treino$Tamanho <- as.numeric(unlist(lapply(treino$Postagens, nchar)))
+  treino <- treino[order(treino$Tamanho, decreasing = TRUE),]
+  treino1 <- subset(treino, (Classe == 1))
+  treino0 <- subset(treino, (Classe == 0))[1:as.integer(2.5 * nrow(treino1)),]
+  treino <- rbind(treino0, treino1)
+  treino <- subset(treino, select = -Tamanho) 
+}
+
+TREINO_5 <- lapply(TREINO_5, recombina)
+```
+## Vetorizando os dados
+```{r}
+#Função TFIDF aplica a vetorização TFIDF nos datasets
+TFIDF <- function(dataset_treino, dataset_teste, n) {
+  # Calcular o TF-IDF para o conjunto de treinamento
+  dtm_treino <- DocumentTermMatrix(dataset_treino$Postagens)
+  tfidf_treino <- weightTfIdf(dtm_treino)
+  tfidf_treino <- as.data.frame(as.matrix(tfidf_treino))
+  # Calcular o TF-IDF para o conjunto de teste
+  dtm_teste <- DocumentTermMatrix(dataset_teste$Postagens)
+  tfidf_teste <- weightTfIdf(dtm_teste)
+  tfidf_teste <- as.data.frame(as.matrix(tfidf_teste))
+  # Manter apenas as n colunas mais altas do conjunto de treinamento e do conjunto de teste
+  colunas_comuns <- sort(intersect(colnames(tfidf_treino), colnames(tfidf_teste)))
+  tfidf_treino <- tfidf_treino[, colunas_comuns]
+  tfidf_teste <- tfidf_teste[, colunas_comuns]
+  # Manter apenas as n colunas mais altas do conjunto de treinamento
+  colunas_importantes <- names(sort(colSums(tfidf_treino), decreasing = TRUE)[1:n])
+  tfidf_treino <- tfidf_treino[, colunas_importantes]
+  tfidf_teste <- tfidf_teste[, colunas_importantes]
+  # Ordem alfabetica
+  tfidf_treino <- tfidf_treino[, order(names(tfidf_treino))]
+  tfidf_teste <- tfidf_teste[, order(names(tfidf_teste))]
+  # Unir dataframe
+  tfidf_treino <- cbind(dataset_treino, tfidf_treino)
+  tfidf_teste <- cbind(dataset_teste, tfidf_teste)
+  return(list(tfidf_treino, tfidf_teste))
+}
+
+# Vetorizando os dados de treinamento e teste
+for (n in 1:10) {
+  cat("Vetorizando datasets", n, "\n")
+  tf_idf <- TFIDF(TREINO_5[[n]], TESTE_5[[n]], 250)
+  TREINO_5[[n]] <- tf_idf[[1]]
+  TESTE_5[[n]] <- tf_idf[[2]]
+}
+```
+## Utilizando SMOTE
+```{r}
+aplicar_SMOTE <- function(data){
+  set.seed(42)
+  genData <- SMOTE(data[,4:253],data[,3], K = 81)
+  genData <- genData$data
+  colnames(genData)[ncol(genData)] <- "Classe"
+  return(genData)
+}
+TREINO_5 <- lapply(TREINO_5, aplicar_SMOTE)
+```
+## Verificando número de amostras
+```{r}
+# Contagem de amostra por classe
+count_train <- table(TREINO_5[[1]]$Classe)
+count_test <- table(TESTE_5[[1]]$Classe)
+#Amostra de Treino
+print(count_train)
+#Amostra de teste
+print(count_test)
+```
+## Treinando e testando usando Random Forest
+```{r}
+# Defina os valores de mtry (hiperparametro) que deseja avaliar
+hipeparametro <- c(2, 126, 250)
+
+# Vetores para armazenar as métricas médias para cada mtry
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de mtry
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_5))
+  sensibilidade <- numeric(length(TREINO_5))
+  especificidade <- numeric(length(TREINO_5))
+  auc_n <- numeric(length(TREINO_5))
+  fscore <- numeric(length(TREINO_5))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_5)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o mtry =', h, '\n')
+    
+    treino <- TREINO_5[[j]]
+    teste <- TESTE_5[[j]]
+    x <- treino[,-ncol(treino)]
+    y <- as.factor(treino[, ncol(treino)])
+    
+    # Treine o modelo com o valor atual de mtry
+    modelo <- train(x, y, method = "rf",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(mtry = c(h)))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F-score (usando precisão e sensibilidade)
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    fscore[j] <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      2 * (precision * recall) / (precision + recall)
+      } else {
+        NA
+        }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de mtry
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Mtry =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando XGBoost
+```{r}
+# Defina os valores de mtry (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(250, 300, 350)
+
+# Vetores para armazenar as métricas médias para cada valor testado
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para treinar e testar modelos para diferentes valores de nround
+for (i in 1:length(hipeparametro)) {
+  h <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_5))
+  sensibilidade <- numeric(length(TREINO_5))
+  especificidade <- numeric(length(TREINO_5))
+  auc_n <- numeric(length(TREINO_5))
+  fscore <- numeric(length(TREINO_5))
+  
+  # Loop para treinar e testar para cada dataset
+  for (j in 1:length(TREINO_5)) {
+    set.seed(42)
+    cat('treinando e testando os dataset de número', j, 'com o nround =', h, '\n')
+    
+    treino <- TREINO_5[[j]]
+    teste <- TESTE_5[[j]]
+    x <- treino[,-ncol(treino)]
+    y <- as.factor(treino[, ncol(treino)])
+    
+    # Treine o modelo com o valor atual de nround
+    modelo <- train(x, y, method = "xgbTree",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(nrounds = c(h), max_depth = 4, eta = 0.1, gamma = 3, colsample_bytree = 0.6, min_child_weight = 1, subsample = 0.5))
+    
+    # Faça previsões nos dados de teste
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Matriz de confusão
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+    
+    # Métricas básicas
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com tratamento de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    # AUC
+    r <- roc(as.integer(teste$Classe), as.integer(pred))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Calcule as médias para o valor atual de nround
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Nrounds =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
+## Treinando e testando usando glmnet
+```{r}
+# Defina os valores de lambda (hiperparâmetro) que deseja avaliar
+hipeparametro <- c(0.1, 0.5, 1)
+
+# Vetores para armazenar as métricas médias
+media_acuracia <- numeric(length(hipeparametro))
+media_sensibilidade <- numeric(length(hipeparametro))
+media_especificidade <- numeric(length(hipeparametro))
+media_auc <- numeric(length(hipeparametro))
+media_fscore <- numeric(length(hipeparametro))
+
+# Loop para testar cada valor de lambda
+for (i in 1:length(hipeparametro)) {
+  lambda_atual <- hipeparametro[i]
+  acuracia <- numeric(length(TREINO_5))
+  sensibilidade <- numeric(length(TREINO_5))
+  especificidade <- numeric(length(TREINO_5))
+  auc_n <- numeric(length(TREINO_5))
+  fscore <- numeric(length(TREINO_5))
+  
+  for (j in 1:length(TREINO_5)) {
+    set.seed(42)
+    cat('Treinando e testando dataset número', j, 'com lambda =', lambda_atual, '\n')
+    
+    treino <- TREINO_5[[j]]
+    teste <- TESTE_5[[j]]
+    
+    x <- treino[,-ncol(treino)]
+    y <- as.factor(treino[, ncol(treino)])
+    
+    # Treinamento do modelo glmnet com lambda fixo
+    modelo <- train(x, y, method = "glmnet",
+                    trControl = trainControl(method = "cv"),
+                    tuneGrid = expand.grid(alpha = 0.01, lambda = lambda_atual))
+    
+    # Previsão
+    pred <- predict(modelo, newdata = teste[, 4:ncol(teste)])
+    
+    # Avaliação
+    cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = "1")
+    acuracia[j] <- cm$overall["Accuracy"]
+    sensibilidade[j] <- cm$byClass["Recall"]
+    especificidade[j] <- cm$byClass["Specificity"]
+    
+    # F1-score com verificação de NA
+    precision <- cm$byClass["Precision"]
+    recall <- cm$byClass["Recall"]
+    
+    if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      fscore[j] <- 2 * (precision * recall) / (precision + recall)
+    } else {
+      fscore[j] <- NA
+    }
+    
+    r <- roc(as.numeric(as.character(teste$Classe)), as.numeric(as.character(pred)))
+    auc_n[j] <- auc(r)
+  }
+  
+  # Métricas médias para o lambda atual
+  media_acuracia[i] <- mean(acuracia)
+  media_sensibilidade[i] <- mean(sensibilidade)
+  media_especificidade[i] <- mean(especificidade)
+  media_auc[i] <- mean(auc_n)
+  media_fscore[i] <- mean(fscore, na.rm = TRUE)
+}
+```
+## Avaliando o desempenho do modelo
+```{r}
+# Exiba as médias das acurácias para cada valor de mtry
+for (i in 1:length(hipeparametro)) {
+  cat("Lambda =", hipeparametro[i], "\n")
+  cat("Acurácia Média =", media_acuracia[i], "\n")
+  cat("Recall Médio =", media_sensibilidade[i], "\n")
+  cat("Especificidade Média =", media_especificidade[i], "\n")
+  cat("F1 Score = ", media_fscore[i], "\n")
+  cat("AUC =", media_auc[i], "\n\n")
+}
+```
