@@ -1,0 +1,401 @@
+---
+title: "METODO 2 - Redução da Classe Marjoritária (n0 = n1)."
+output: html_notebook
+---
+# Carregando os pacotes
+```{r}
+library(stringr)
+library(tm)
+library(caret)
+library(pROC)
+library(randomForest)
+library(xgboost)
+library(smotefamily)
+library(glmnet)
+library(ggplot2)
+library(reshape2)
+```
+# Carregando os dados de treinamento e teste
+```{r}
+# Diretório onde estão os CSV preparados
+dir_saida <- "C:/Users/usuario/OneDrive/Documentos/Text_Mining_Reddit_Depression_Post/Dados_Preparados"
+
+# Função para carregar datasets em lista
+carregar_datasets <- function(prefixo, n, pasta){
+  lista <- list()
+  for (i in 1:n){
+    caminho <- file.path(pasta, paste0(prefixo, "_", i, "_preparado.csv"))
+    df <- read.csv(caminho, stringsAsFactors = FALSE)
+    lista[[i]] <- df
+  }
+  return(lista)
+}
+
+# Carregar novamente as listas
+TREINO <- carregar_datasets("treino", 10, dir_saida)
+TESTE  <- carregar_datasets("teste", 10, dir_saida)
+```
+# Pipeline do Método 2
+```{r}
+# Função de Vetorização TF-IDF
+TFIDF <- function(dataset_treino, dataset_teste, n) {
+  dtm_treino <- DocumentTermMatrix(dataset_treino$Postagens)
+  tfidf_treino <- weightTfIdf(dtm_treino)
+  tfidf_treino <- as.data.frame(as.matrix(tfidf_treino))
+  
+  dtm_teste <- DocumentTermMatrix(dataset_teste$Postagens)
+  tfidf_teste <- weightTfIdf(dtm_teste)
+  tfidf_teste <- as.data.frame(as.matrix(tfidf_teste))
+  
+  colunas_comuns <- sort(intersect(colnames(tfidf_treino), colnames(tfidf_teste)))
+  tfidf_treino <- tfidf_treino[, colunas_comuns]
+  tfidf_teste <- tfidf_teste[, colunas_comuns]
+  
+  colunas_importantes <- names(sort(colSums(tfidf_treino), decreasing = TRUE)[1:n])
+  tfidf_treino <- tfidf_treino[, colunas_importantes]
+  tfidf_teste <- tfidf_teste[, colunas_importantes]
+  
+  tfidf_treino <- tfidf_treino[, order(names(tfidf_treino))]
+  tfidf_teste <- tfidf_teste[, order(names(tfidf_teste))]
+  
+  tfidf_treino <- cbind(dataset_treino, tfidf_treino)
+  tfidf_teste <- cbind(dataset_teste, tfidf_teste)
+  return(list(tfidf_treino, tfidf_teste))
+}
+
+# Função para avaliar modelos
+avaliar_modelo <- function(modelo, treino, teste, j, param_name, param_value, modelo_nome) {
+  set.seed(42)
+  x <- treino[, 4:ncol(treino)]
+  y <- as.factor(treino$Classe)
+  
+  # treino
+  fit <- train(x, y, method = modelo,
+               trControl = trainControl(method = "cv"),
+               tuneGrid = param_value)
+  
+  # previsão
+  pred <- predict(fit, newdata = teste[, 4:ncol(teste)])
+  
+  # métricas
+  cm <- confusionMatrix(pred, as.factor(teste$Classe), positive = '1')
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  f1 <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+    2 * (precision * recall) / (precision + recall)
+  } else { NA }
+  
+  r <- roc(as.integer(teste$Classe), as.integer(pred))
+  
+  res <- list(
+    acuracia = cm$overall["Accuracy"],
+    recall = cm$byClass["Recall"],
+    especificidade = cm$byClass["Specificity"],
+    f1 = f1,
+    auc = auc(r),
+    predicoes = data.frame(
+      Usuario = teste$Usuario,
+      Classe = teste$Classe,
+      Predito = pred,
+      Dataset = j,
+      Modelo = modelo_nome,
+      Parametro = param_name
+    )
+  )
+  return(res)
+}
+
+# Construir grade de parâmetros
+construir_param_grid <- function(modelo, param_name, param_value) {
+  if (modelo == "GLM") {
+    return(expand.grid(alpha = 0.01, lambda = param_value))
+  } else if (modelo == "RF") {
+    return(expand.grid(mtry = param_value))
+  } else if (modelo == "XGB") {
+    return(expand.grid(
+      nrounds = param_value, max_depth = 4, eta = 0.1, gamma = 3,
+      colsample_bytree = 0.6, min_child_weight = 1, subsample = 0.5
+    ))
+  }
+}
+
+# Salvar predições wide em CSV
+salvar_predicoes <- function(predicoes_wide, modelo, param_name, param_value, dir_saida) {
+  nome_csv <- paste0(dir_saida, "/", modelo, "_", param_name, "_", param_value, "_predicoes.csv")
+  write.csv(predicoes_wide, nome_csv, row.names = FALSE)
+  cat("   >>> Resultados salvos em:", nome_csv, "\n")
+}
+
+# Salvar métricas individuais (long)
+salvar_metricas_long <- function(acuracias, recalls, especificidades, f1s, aucs,
+                                 modelo, param_name, param_value, dir_saida) {
+  metricas_long <- data.frame(
+    Modelo = modelo,
+    Parametro = paste0(param_name, "=", param_value),
+    Dataset = 1:10,
+    Acuracia = acuracias,
+    Recall = recalls,
+    Especificidade = especificidades,
+    F1 = f1s,
+    AUC = aucs
+  )
+  
+  nome_csv_long <- paste0(dir_saida, "/", modelo, "_", param_name, "_", param_value, "_metricas_long.csv")
+  write.csv(metricas_long, nome_csv_long, row.names = FALSE)
+  cat("   >>> Métricas individuais salvas em:", nome_csv_long, "\n")
+}
+
+# Gerar matriz de confusão agregada (deduplicando usuários) (CSV + imagem + mapping)
+gerar_confusion_matrix <- function(predicoes_wide, modelo, param_name, param_value, dir_saida) {
+  require(reshape2)
+  require(caret)
+  require(ggplot2)
+  
+  # identificar colunas de predição
+  pred_cols <- grep("^Predito_", names(predicoes_wide), value = TRUE)
+  if (length(pred_cols) == 0) {
+    warning("Nenhuma coluna Predito_ encontrada em predicoes_wide. Abortando geracao da matriz.")
+    return(NULL)
+  }
+  
+  # converter para long (Usuario, Classe, Fold, Predito)
+  long_df <- reshape2::melt(predicoes_wide,
+                            id.vars = c("Usuario", "Classe"),
+                            measure.vars = pred_cols,
+                            variable.name = "Fold",
+                            value.name = "Predito")
+  
+  # remover predições NA (se houver)
+  long_df <- long_df[!is.na(long_df$Predito), ]
+  if (nrow(long_df) == 0) {
+    warning("Nenhuma predição válida encontrada após remoção de NA. Abortando geracao da matriz.")
+    return(NULL)
+  }
+  
+  # função para calcular modo com desempate preferindo "1"
+  get_mode_pref1 <- function(x) {
+    x <- as.character(x)
+    x <- x[!is.na(x)]
+    if (length(x) == 0) return(NA)
+    counts <- table(x)
+    maxc <- max(counts)
+    modes <- names(counts[counts == maxc])
+    if (length(modes) > 1) {
+      if ("1" %in% modes) return("1") else return(modes[1])
+    } else {
+      return(modes[1])
+    }
+  }
+  
+  # obter predição agregada por usuario (maioria)
+  pred_mode <- aggregate(Predito ~ Usuario, data = long_df, FUN = get_mode_pref1)
+  # obter classe verdadeira por usuario (pega a primeira; deve ser consistente entre folds)
+  true_class <- aggregate(Classe ~ Usuario, data = long_df, FUN = function(x) as.character(x[1]))
+  
+  # juntar
+  dedup <- merge(true_class, pred_mode, by = "Usuario")
+  names(dedup)[names(dedup) == "Classe"] <- "Classe_true"
+  names(dedup)[names(dedup) == "Predito"] <- "Predito_mode"
+  
+  # limpar linhas com NA
+  dedup <- dedup[!is.na(dedup$Classe_true) & !is.na(dedup$Predito_mode), ]
+  if (nrow(dedup) == 0) {
+    warning("Nenhum usuario com classe e predicao válida apos deduplicacao. Abortando geracao da matriz.")
+    return(NULL)
+  }
+  
+  # preparar fatores com níveis consistentes ("0","1")
+  dedup$Classe_true <- as.character(dedup$Classe_true)
+  dedup$Predito_mode <- as.character(dedup$Predito_mode)
+  
+  # filtrar apenas níveis esperados
+  dedup <- dedup[dedup$Classe_true %in% c("0","1") & dedup$Predito_mode %in% c("0","1"), ]
+  if (nrow(dedup) == 0) {
+    warning("Após filtrar níveis esperados ('0'/'1') não restaram usuários válidos.")
+    return(NULL)
+  }
+  
+  # construir matriz de confusão usando uma linha por usuario
+  cm <- confusionMatrix(
+    factor(dedup$Predito_mode, levels = c("0","1")),
+    factor(dedup$Classe_true, levels = c("0","1")),
+    positive = "1"
+  )
+  
+  # salvar CSV da matriz de confusão
+  cm_csv <- paste0(dir_saida, "/", modelo, "_", param_name, "_", param_value, "_confusion_matrix.csv")
+  write.csv(as.data.frame(cm$table), cm_csv, row.names = FALSE)
+  cat("   >>> Matriz de confusão (dedup) salva em:", cm_csv, "\n")
+  
+  # salvar CSV com mapeamento Usuario -> Classe_true -> Predito_mode (para auditoria)
+  mapping_csv <- paste0(dir_saida, "/", modelo, "_", param_name, "_", param_value, "_predicoes_por_usuario.csv")
+  write.csv(dedup, mapping_csv, row.names = FALSE)
+  cat("   >>> Predicoes por usuario (deduplicadas) salvas em:", mapping_csv, "\n")
+  
+  # plot (heatmap) da matriz de confusão
+  cm_df <- as.data.frame(cm$table)
+  p <- ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq), color = "white", size = 6) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    labs(title = paste("Matriz de Confusão (dedup) -", modelo, param_name, "=", param_value)) +
+    theme_minimal()
+  
+  cm_png <- paste0(dir_saida, "/", modelo, "_", param_name, "_", param_value, "_confusion_matrix.png")
+  ggsave(cm_png, p, width = 6, height = 5)
+  cat("   >>> Imagem da matriz salva em:", cm_png, "\n")
+  
+  invisible(cm)
+}
+
+# Função para gerar boxplots por métrica (5 imagens no total)
+gerar_boxplots_por_metrica <- function(resultados_metricas, dir_saida) {
+  # resultados_metricas é uma lista de data.frames individuais já salvos em salvar_metricas_long
+  # Aqui vamos combinar tudo
+  
+  todas_metricas <- do.call(rbind, resultados_metricas)
+  
+  # percorrer cada métrica separada
+  for (metrica in c("Acuracia", "Recall", "Especificidade", "F1", "AUC")) {
+    df_metrica <- todas_metricas[, c("Modelo", "Parametro", "Dataset", metrica)]
+    names(df_metrica)[4] <- "Valor"
+    df_metrica$Comb <- paste(df_metrica$Modelo, df_metrica$Parametro, sep = "_")
+    
+    p <- ggplot(df_metrica, aes(x = Comb, y = Valor, fill = Modelo)) +
+      geom_boxplot() +
+      labs(title = paste("Boxplots -", metrica),
+           x = "Modelo + Parâmetro", y = metrica) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+    
+    # salvar imagem
+    boxplot_png <- paste0(dir_saida, "/Boxplot_", metrica, ".png")
+    ggsave(boxplot_png, p, width = 9, height = 6)
+    cat(">>> Boxplot da métrica", metrica, "salvo em:", boxplot_png, "\n")
+  }
+}
+
+#Função para recombinar amostras
+recombina <- function(treino){
+  treino$Tamanho <- as.numeric(unlist(lapply(treino$Postagens, nchar)))
+  treino <- treino[order(treino$Tamanho, decreasing = TRUE),]
+  treino1 <- subset(treino, (Classe == 1))
+  treino0 <- subset(treino, (Classe == 0))[1:nrow(treino1),]
+  treino <- rbind(treino0, treino1)
+  treino <- subset(treino, select = -Tamanho)
+  return(treino)
+}
+
+
+rodar_pipeline <- function(TREINO, TESTE, dir_saida) {
+  # Vetorização
+  cat("==== Etapa 1: Vetorizando dados com TF-IDF ====\n")
+  for (n in 1:10) {
+    cat("-> Balanceando conjunto", n, "\n")
+    TREINO[[n]] <- recombina(TREINO[[n]])
+    cat("-> Vetorizando conjunto", n, "\n")
+    tfidf <- TFIDF(TREINO[[n]], TESTE[[n]], 250)
+    TREINO[[n]] <- tfidf[[1]]
+    TESTE[[n]]  <- tfidf[[2]]
+  }
+  
+  # Configurações de modelos
+  configs <- list(
+    RF = list(param = list(mtry = c(2, 126, 250)), method = "rf"),
+    XGB = list(param = list(nrounds = c(250, 300, 350)), method = "xgbTree"),
+    GLM = list(param = list(lambda = c(0.1, 0.5, 1)), method = "glmnet")
+  )
+  
+  # DataFrames finais
+  medias_metricas <- list()
+  resultados_metricas <- list()   # <- acumula métricas para boxplots
+  
+  cat("\n==== Etapa 2: Treinando e testando modelos ====\n")
+  for (modelo in names(configs)) {
+    params <- configs[[modelo]]$param
+    method <- configs[[modelo]]$method
+    
+    for (param_name in names(params)) {
+      for (param_value in params[[param_name]]) {
+        cat("\n---> Modelo:", modelo, "| Parâmetro:", param_name, "=", param_value, "\n")
+        
+        acuracias <- c(); recalls <- c(); especificidades <- c(); f1s <- c(); aucs <- c()
+        
+        predicoes_wide <- data.frame(
+          Usuario = TESTE[[1]]$Usuario,
+          Classe = TESTE[[1]]$Classe
+        )
+        
+        for (j in 1:10) {
+          cat("   [", modelo, param_name, "=", param_value, "] Rodando dataset", j, "\n")
+          
+          treino <- TREINO[[j]]
+          teste  <- TESTE[[j]]
+          
+          param_grid <- construir_param_grid(modelo, param_name, param_value)
+          
+          res <- avaliar_modelo(method, treino, teste, j,
+                                paste0(param_name, "=", param_value),
+                                param_grid, modelo)
+          
+          acuracias <- c(acuracias, res$acuracia)
+          recalls <- c(recalls, res$recall)
+          especificidades <- c(especificidades, res$especificidade)
+          f1s <- c(f1s, res$f1)
+          aucs <- c(aucs, res$auc)
+          
+          predicoes_wide[[paste0("Predito_", j)]] <- res$predicoes$Predito
+        }
+        
+        # Salvar resultados individuais
+        salvar_predicoes(predicoes_wide, modelo, param_name, param_value, dir_saida)
+        salvar_metricas_long(acuracias, recalls, especificidades, f1s, aucs,
+                             modelo, param_name, param_value, dir_saida)
+        gerar_confusion_matrix(predicoes_wide, modelo, param_name, param_value, dir_saida)
+        
+        # Guardar métricas para boxplots comparativos
+        resultados_metricas[[paste0(modelo, "_", param_name, "_", param_value)]] <- data.frame(
+          Modelo = modelo,
+          Parametro = paste0(param_name, "=", param_value),
+          Dataset = 1:10,
+          Acuracia = acuracias,
+          Recall = recalls,
+          Especificidade = especificidades,
+          F1 = f1s,
+          AUC = aucs
+        )
+        
+        # Salvar métricas médias
+        medias_metricas[[paste0(modelo, "_", param_name, "_", param_value)]] <- c(
+          mean(acuracias, na.rm = TRUE),
+          mean(recalls, na.rm = TRUE),
+          mean(especificidades, na.rm = TRUE),
+          mean(f1s, na.rm = TRUE),
+          mean(aucs, na.rm = TRUE)
+        )
+      }
+    }
+  }
+  
+  # salvar CSV final de métricas médias
+  cat("\n==== Etapa 3: Salvando métricas médias ====\n")
+  df_metricas <- as.data.frame(do.call(cbind, medias_metricas))
+  rownames(df_metricas) <- c("Acuracia", "Recall", "Especificidade", "F1", "AUC")
+  write.csv(df_metricas, paste0(dir_saida, "/metricas_medias.csv"))
+  cat(">>> Métricas médias salvas em:", paste0(dir_saida, "/metricas_medias.csv"), "\n")
+  
+  # gerar boxplots comparativos
+  cat("\n==== Etapa 4: Gerando boxplots comparativos ====\n")
+  gerar_boxplots_por_metrica(resultados_metricas, dir_saida)
+  
+  return(df_metricas)
+}
+
+# Execução do pipeline
+resultado <- rodar_pipeline(
+  TREINO,
+  TESTE,
+  "C:/Users/usuario/OneDrive/Documentos/Text_Mining_Reddit_Depression_Post/Resultado/METODO_2"
+)
+```
